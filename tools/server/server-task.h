@@ -545,6 +545,7 @@ struct server_task_result_slot_save_load : server_task_result {
 
     size_t n_tokens;
     size_t n_bytes;
+    size_t n_ckpt = 0; // context checkpoints written to / read from the file
     double t_ms;
 
     virtual json to_json() override;

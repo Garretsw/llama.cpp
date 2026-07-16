@@ -2134,11 +2134,7 @@ void common_prompt_checkpoint::load_tgt(
         llama_context * ctx,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) const {
-    if (ctx == nullptr) {
-        return;
-    }
-
-    if (data_tgt.empty()) {
+    if (ctx == nullptr || data_tgt.empty()) {
         return;
     }
 
@@ -2152,11 +2148,7 @@ void common_prompt_checkpoint::load_dft(
         llama_context * ctx,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) const {
-    if (ctx == nullptr) {
-        return;
-    }
-
-    if (data_dft.empty()) {
+    if (ctx == nullptr || data_dft.empty()) {
         return;
     }
 
@@ -2164,6 +2156,32 @@ void common_prompt_checkpoint::load_dft(
     if (n != data_dft.size()) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_dft.size(), n);
     }
+}
+
+bool common_prompt_checkpoint::try_load_tgt(
+        llama_context * ctx,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags) const {
+    if (ctx == nullptr || data_tgt.empty()) {
+        return true;
+    }
+
+    const size_t n = llama_state_seq_set_data_ext(ctx, data_tgt.data(), data_tgt.size(), seq_id, flags);
+
+    return n == data_tgt.size();
+}
+
+bool common_prompt_checkpoint::try_load_dft(
+        llama_context * ctx,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags) const {
+    if (ctx == nullptr || data_dft.empty()) {
+        return true;
+    }
+
+    const size_t n = llama_state_seq_set_data_ext(ctx, data_dft.data(), data_dft.size(), seq_id, flags);
+
+    return n == data_dft.size();
 }
 
 void common_prompt_checkpoint::clear_tgt() {

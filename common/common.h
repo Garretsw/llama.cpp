@@ -1139,6 +1139,18 @@ struct common_prompt_checkpoint {
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;
 
+    // as load_tgt/load_dft, but return false instead of aborting when the blob
+    // cannot be applied (e.g. a checkpoint deserialized from a stale slot save file)
+    bool try_load_tgt(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags) const;
+
+    bool try_load_dft(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags) const;
+
     void clear_tgt();
     void clear_dft();
 };

@@ -1566,10 +1566,11 @@ json server_task_result_metrics::to_json() {
 json server_task_result_slot_save_load::to_json() {
     if (is_save) {
         return json {
-            { "id_slot",   id_slot },
-            { "filename",  filename },
-            { "n_saved",   n_tokens },
-            { "n_written", n_bytes },
+            { "id_slot",      id_slot },
+            { "filename",     filename },
+            { "n_saved",      n_tokens },
+            { "n_written",    n_bytes },
+            { "n_ckpt_saved", n_ckpt },
             { "timings", {
                 { "save_ms", t_ms }
             }},
@@ -1577,10 +1578,11 @@ json server_task_result_slot_save_load::to_json() {
     }
 
     return json {
-        { "id_slot",    id_slot },
-        { "filename",   filename },
-        { "n_restored", n_tokens },
-        { "n_read",     n_bytes },
+        { "id_slot",         id_slot },
+        { "filename",        filename },
+        { "n_restored",      n_tokens },
+        { "n_read",          n_bytes },
+        { "n_ckpt_restored", n_ckpt },
         { "timings", {
             { "restore_ms", t_ms }
         }},

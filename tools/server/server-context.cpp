@@ -841,6 +841,137 @@ struct server_metrics {
     }
 };
 
+//
+// slot save-file checkpoint section
+//
+// context checkpoints (PARTIAL_ONLY state blobs for SWA/recurrent memory) are
+// appended to slot save files as a trailing section so that a restored slot
+// can still roll back past a divergence point. the core sequence-state loader
+// ignores trailing bytes, so files carrying this section remain readable by
+// builds that do not know about it.
+
+static constexpr uint32_t SLOT_CKPT_MAGIC   = 0x50434B43; // "CKPC"
+static constexpr uint32_t SLOT_CKPT_VERSION = 1;
+static constexpr uint32_t SLOT_CKPT_MAX     = 4096;
+
+// returns the number of bytes appended, or 0 on failure
+static size_t slot_checkpoints_append_file(const std::string & filepath, const std::list<common_prompt_checkpoint> & checkpoints) {
+    if (checkpoints.empty()) {
+        return 0;
+    }
+
+    std::ofstream fout(filepath, std::ios::binary | std::ios::app);
+    if (!fout) {
+        return 0;
+    }
+
+    const auto write_u32 = [&](uint32_t v) { fout.write((const char *) &v, sizeof(v)); };
+    const auto write_u64 = [&](uint64_t v) { fout.write((const char *) &v, sizeof(v)); };
+
+    const auto write_blob = [&](const std::vector<uint8_t> & v) {
+        write_u64(v.size());
+        if (!v.empty()) {
+            fout.write((const char *) v.data(), v.size());
+        }
+    };
+
+    const std::streampos pos0 = fout.tellp();
+
+    write_u32(SLOT_CKPT_MAGIC);
+    write_u32(SLOT_CKPT_VERSION);
+    write_u32((uint32_t) checkpoints.size());
+
+    for (const auto & ckpt : checkpoints) {
+        const int64_t n_tokens = ckpt.n_tokens;
+        const int32_t pos_min  = ckpt.pos_min;
+        const int32_t pos_max  = ckpt.pos_max;
+
+        fout.write((const char *) &n_tokens, sizeof(n_tokens));
+        fout.write((const char *) &pos_min,  sizeof(pos_min));
+        fout.write((const char *) &pos_max,  sizeof(pos_max));
+
+        write_blob(ckpt.data_tgt);
+        write_blob(ckpt.data_dft);
+        write_blob(ckpt.data_spec);
+    }
+
+    if (!fout) {
+        return 0;
+    }
+
+    return (size_t) (fout.tellp() - pos0);
+}
+
+// read the checkpoint section starting at `offset` (the end of the core
+// sequence state, as reported by llama_state_seq_load_file). returns false
+// and leaves `checkpoints` empty when the section is absent or malformed.
+static bool slot_checkpoints_read_file(const std::string & filepath, size_t offset, std::list<common_prompt_checkpoint> & checkpoints) {
+    checkpoints.clear();
+
+    std::ifstream fin(filepath, std::ios::binary);
+    if (!fin) {
+        return false;
+    }
+
+    fin.seekg(0, std::ios::end);
+    const uint64_t file_size = (uint64_t) fin.tellg();
+    if (file_size < offset + 3*sizeof(uint32_t)) {
+        return false; // no checkpoint section (file predates this format)
+    }
+    fin.seekg(offset, std::ios::beg);
+
+    const auto read_blob = [&](std::vector<uint8_t> & v) -> bool {
+        uint64_t len = 0;
+        fin.read((char *) &len, sizeof(len));
+        if (!fin || len > file_size - (uint64_t) fin.tellg()) {
+            return false;
+        }
+        v.resize(len);
+        if (len > 0) {
+            fin.read((char *) v.data(), len);
+        }
+        return (bool) fin;
+    };
+
+    uint32_t magic   = 0;
+    uint32_t version = 0;
+    uint32_t count   = 0;
+
+    fin.read((char *) &magic,   sizeof(magic));
+    fin.read((char *) &version, sizeof(version));
+    fin.read((char *) &count,   sizeof(count));
+
+    if (!fin || magic != SLOT_CKPT_MAGIC || version != SLOT_CKPT_VERSION || count > SLOT_CKPT_MAX) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < count; ++i) {
+        int64_t n_tokens = 0;
+        int32_t pos_min  = 0;
+        int32_t pos_max  = 0;
+
+        fin.read((char *) &n_tokens, sizeof(n_tokens));
+        fin.read((char *) &pos_min,  sizeof(pos_min));
+        fin.read((char *) &pos_max,  sizeof(pos_max));
+
+        if (!fin) {
+            checkpoints.clear();
+            return false;
+        }
+
+        common_prompt_checkpoint ckpt;
+        ckpt.update_pos(n_tokens, pos_min, pos_max);
+
+        if (!read_blob(ckpt.data_tgt) || !read_blob(ckpt.data_dft) || !read_blob(ckpt.data_spec)) {
+            checkpoints.clear();
+            return false;
+        }
+
+        checkpoints.push_back(std::move(ckpt));
+    }
+
+    return true;
+}
 
 //
 // server_context_impl (private implementation)
@@ -2528,6 +2659,20 @@ private:
                     const llama_tokens & tokens = slot->prompt.tokens.get_tokens();
                     const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
 
+                    // append the context checkpoints (SWA/recurrent partial state) so a
+                    // future restore can roll back past a divergence point
+                    size_t n_ckpt       = 0;
+                    size_t nwrite_ckpt  = 0;
+                    if (nwrite > 0 && !slot->prompt.checkpoints.empty()) {
+                        nwrite_ckpt = slot_checkpoints_append_file(filepath, slot->prompt.checkpoints);
+                        if (nwrite_ckpt > 0) {
+                            n_ckpt = slot->prompt.checkpoints.size();
+                            SRV_INF("appended %zu context checkpoints (%zu bytes) to slot save file '%s'\n", n_ckpt, nwrite_ckpt, filename.c_str());
+                        } else {
+                            SRV_WRN("failed to append %zu context checkpoints to slot save file '%s'\n", slot->prompt.checkpoints.size(), filename.c_str());
+                        }
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2537,7 +2682,8 @@ private:
                     res->filename = filename;
                     res->is_save  = true;
                     res->n_tokens = token_count;
-                    res->n_bytes  = nwrite;
+                    res->n_bytes  = nwrite + nwrite_ckpt;
+                    res->n_ckpt   = n_ckpt;
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
                 } break;
@@ -2575,6 +2721,14 @@ private:
                     slot->prompt.clear();
                     slot->prompt.tokens.insert(tokens);
 
+                    // rebuild the context checkpoints from the trailing section, if
+                    // present (nread is the end offset of the core sequence state)
+                    size_t n_ckpt = 0;
+                    if (slot_checkpoints_read_file(filepath, nread, slot->prompt.checkpoints)) {
+                        n_ckpt = slot->prompt.checkpoints.size();
+                        SRV_INF("restored %zu context checkpoints from slot save file '%s'\n", n_ckpt, filename.c_str());
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
 
@@ -2585,6 +2739,7 @@ private:
                     res->is_save  = false;
                     res->n_tokens = token_count;
                     res->n_bytes  = nread;
+                    res->n_ckpt   = n_ckpt;
                     res->t_ms     = t_restore_ms;
                     queue_results.send(std::move(res));
                 } break;
@@ -3299,14 +3454,23 @@ private:
 
                                     if (!do_reset) {
                                         // restore the context checkpoint
-                                        it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        // restore the draft's speculative state
-                                        common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+                                        // a checkpoint that fails to apply (e.g. one deserialized from a stale
+                                        // slot save file) is discarded and the prompt is re-processed from scratch
+                                        const bool ok_tgt = it->try_load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        const bool ok_dft = ok_tgt && it->try_load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
-                                        pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
-                                        n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
-                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                        if (!ok_tgt || !ok_dft) {
+                                            SLT_WRN(slot, "failed to apply context checkpoint (pos_min = %d, pos_max = %d) - discarding it\n", it->pos_min, it->pos_max);
+                                            slot.prompt.checkpoints.erase(std::next(it).base());
+                                            do_reset = true;
+                                        } else {
+                                            // restore the draft's speculative state
+                                            common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+
+                                            pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                            n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                            SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                        }
                                     }
 
                                     if (do_reset) {
@@ -4551,6 +4715,7 @@ void server_routes::init_routes() {
             { "bos_token",                   meta->bos_token_str },
             { "eos_token",                   meta->eos_token_str },
             { "build_info",                  meta->build_info },
+            { "slot_checkpoints",            true }, // slot save files carry context checkpoints
             { "is_sleeping",                 queue_tasks.is_sleeping() },
             { "cors_proxy_enabled",          params.ui_mcp_proxy },
         };
