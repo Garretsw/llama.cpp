@@ -4,7 +4,7 @@ from utils import *
 # tinygemma3 uses sliding-window attention (gemma3.attention.sliding_window),
 # so any divergent continuation relies on context checkpoints: without a
 # usable checkpoint the server forces full prompt re-processing. These tests
-# verify that slot save files carry the checkpoints (trailing "CKPC" section)
+# verify that slot save files carry the checkpoints (trailing context checkpoint appendix)
 # and that a restored slot can resume from one after a mid-prompt divergence.
 server = ServerPreset.tinygemma3()
 
