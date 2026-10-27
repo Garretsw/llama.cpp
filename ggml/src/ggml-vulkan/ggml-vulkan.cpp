@@ -16016,6 +16016,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
+            // TODO: investigate - the wkv6/wkv7 shaders hard-code BLOCK_SIZE 64 as the head size, but any head
+            //       size is reported as supported (see the head_size 128 cases in test-backend-ops)
             return true; // all inputs are contiguous, see ggml.c
         case GGML_OP_GATED_LINEAR_ATTN:
             // the shader block size is hardcoded to head_size 64
