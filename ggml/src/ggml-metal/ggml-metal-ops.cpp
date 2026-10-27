@@ -1898,6 +1898,8 @@ int ggml_metal_op_rwkv(ggml_metal_op_t ctx, int idx) {
     const int64_t C = op->ne[0];
     const int64_t H = op->src[0]->ne[1];
 
+    GGML_ASSERT(C / H == 64); // see ggml_metal_device_supports_op
+
     auto pipeline = ggml_metal_library_get_pipeline_rwkv(lib, op);
 
     int ida = 0;
