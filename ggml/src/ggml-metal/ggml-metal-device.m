@@ -2302,6 +2302,21 @@ bool ggml_metal_buffer_is_shared(ggml_metal_buffer_t buf) {
     return buf->is_shared;
 }
 
+// check a completed command buffer of a synchronous buffer operation, log the failure reason if it failed
+static bool ggml_metal_buffer_cmd_buf_ok(id<MTLCommandBuffer> cmd_buf, const char * fn) {
+    const MTLCommandBufferStatus status = [cmd_buf status];
+    if (status == MTLCommandBufferStatusCompleted) {
+        return true;
+    }
+
+    GGML_LOG_ERROR("%s: error: command buffer failed with status %d\n", fn, (int) status);
+    if (status == MTLCommandBufferStatusError) {
+        GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
+    }
+
+    return false;
+}
+
 void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     if (buf->is_shared) {
         memset((char *) tensor->data + offset, value, size);
@@ -2327,6 +2342,10 @@ void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor
 
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
+
+        if (!ggml_metal_buffer_cmd_buf_ok(cmd_buf, __func__)) {
+            GGML_ABORT("%s: failed to fill the buffer\n", __func__);
+        }
     }
 }
 
@@ -2369,7 +2388,6 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
         }
 
         [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
-                             // TODO: can check for errors here
             GGML_UNUSED(cb);
 
             dispatch_semaphore_signal(completion_semaphore);
@@ -2381,6 +2399,11 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
         dispatch_release(completion_semaphore);
 
         //[cmd_buf waitUntilCompleted];
+
+        // the status is final once the completed handler has run
+        if (!ggml_metal_buffer_cmd_buf_ok(cmd_buf, __func__)) {
+            GGML_ABORT("%s: failed to copy the data to the buffer\n", __func__);
+        }
 
         [buf_src release];
     }
@@ -2423,6 +2446,10 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
         [cmd_buf waitUntilCompleted];
 
         [buf_dst release];
+
+        if (!ggml_metal_buffer_cmd_buf_ok(cmd_buf, __func__)) {
+            GGML_ABORT("%s: failed to copy the data from the buffer\n", __func__);
+        }
     }
 }
 
@@ -2462,6 +2489,10 @@ bool ggml_metal_buffer_cpy_tensor(ggml_metal_buffer_t buf_dst, const struct ggml
 
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
+
+        if (!ggml_metal_buffer_cmd_buf_ok(cmd_buf, __func__)) {
+            return false;
+        }
     }
 
     return true;
@@ -2488,6 +2519,10 @@ void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {
 
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
+
+        if (!ggml_metal_buffer_cmd_buf_ok(cmd_buf, __func__)) {
+            GGML_ABORT("%s: failed to clear the buffer\n", __func__);
+        }
     }
 }
 
