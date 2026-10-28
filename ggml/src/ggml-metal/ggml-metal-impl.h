@@ -177,6 +177,13 @@
 #define OP_UNARY_NUM_TRUNC       120
 #define OP_UNARY_NUM_XIELU       121
 
+// activations of the FFN gate/up + GLU fusion (kernel_mul_mv_glu)
+#define OP_GLU_NUM_REGLU         0
+#define OP_GLU_NUM_GEGLU         1
+#define OP_GLU_NUM_SWIGLU        2
+#define OP_GLU_NUM_GEGLU_ERF     3
+#define OP_GLU_NUM_GEGLU_QUICK   4
+
 #define OP_SUM_ROWS_NUM_SUM_ROWS 10
 #define OP_SUM_ROWS_NUM_MEAN     11
 
@@ -538,6 +545,12 @@ typedef struct {
     int16_t  r2;
     int16_t  r3;
 } ggml_metal_kargs_mul_mv;
+
+// FFN gate/up mat-vec + GLU (GGML_METAL_FUSION_MUL_MAT_GLU)
+typedef struct {
+    ggml_metal_kargs_mul_mv mv;
+    int32_t  nr0_tg; // src0 rows per threadgroup of the wrapped mat-vec kernel
+} ggml_metal_kargs_mul_mv_glu;
 
 typedef struct {
     int32_t  ne00;

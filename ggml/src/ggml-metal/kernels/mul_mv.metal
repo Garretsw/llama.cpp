@@ -214,6 +214,7 @@ constant short FC_mul_mv_ne12  [[function_constant(FC_MUL_MV + 2)]];
 constant short FC_mul_mv_r2    [[function_constant(FC_MUL_MV + 3)]];
 constant short FC_mul_mv_r3    [[function_constant(FC_MUL_MV + 4)]];
 constant bool  FC_mul_mv_split [[function_constant(FC_MUL_MV + 5)]];
+constant short FC_mul_mv_glu   [[function_constant(FC_MUL_MV + 6)]]; // OP_GLU_NUM_*, kernel_mul_mv_glu only
 
 template<typename block_q_type, short NR0, typename args_t>
 void mul_vec_q_n_f32_impl(
@@ -3406,3 +3407,112 @@ template [[host_name("kernel_mul_mv_id_iq2_s_f32")]]   kernel kernel_mul_mv_id_t
 template [[host_name("kernel_mul_mv_id_iq4_nl_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_nl_f32_impl <N_R0_IQ4_NL>>>;
 template [[host_name("kernel_mul_mv_id_iq4_xs_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_xs_f32_impl <N_R0_IQ4_XS>>>;
 template [[host_name("kernel_mul_mv_id_tq2_0_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_tq2_0_f32_impl  <N_R0_TQ2_0>>>;
+
+// FFN gate/up projections + GLU of a single token (GGML_METAL_FUSION_MUL_MAT_GLU): runs the regular mat-vec kernel
+// for the gate and the up weights, writing their usual results, then applies the activation to the rows of this
+// threadgroup - one dispatch instead of three. as dispatched by the host, each threadgroup covers args.nr0_tg
+// consecutive rows of both mat-vecs, which some of its threads write; the activation formulas match kernels/unary.metal
+// note: every thread must reach the barriers, so the wrapped kernels must not return early
+template<mul_mv_disp_fn_t disp_fn>
+kernel void kernel_mul_mv_glu(
+        constant ggml_metal_kargs_mul_mv_glu & args,
+        device const char * src0_g,
+        device const char * src0_u,
+        device const char * src1,
+        device       char * dst_g,
+        device       char * dst_u,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const ggml_metal_kargs_mul_mv args0 = args.mv;
+
+    disp_fn(args0, src0_g, src1, dst_g, shmem, tgpig, tiitg, tiisg, sgitg);
+
+    // the kernels that reduce through threadgroup memory reuse it in the second call
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    disp_fn(args0, src0_u, src1, dst_u, shmem, tgpig, tiitg, tiisg, sgitg);
+
+    // make the rows written by some threads of this threadgroup visible to all of them
+    threadgroup_barrier(mem_flags::mem_device);
+
+    const int64_t offs = (int64_t) tgpig.z*args0.ne0*args0.ne1 + (int64_t) tgpig.y*args0.ne0;
+
+    device const float * g = (device const float *) dst_g + offs;
+    device const float * u = (device const float *) dst_u + offs;
+    device       float * d = (device       float *) dst   + offs;
+
+    const int i0_beg = (int) tgpig.x*args.nr0_tg;
+    const int i0_end = min(i0_beg + args.nr0_tg, args0.ne0);
+
+    const ushort nth = ntg.x*ntg.y*ntg.z;
+
+    for (int i0 = i0_beg + tiitg; i0 < i0_end; i0 += nth) {
+        const float x0 = g[i0];
+        const float x1 = u[i0];
+
+        float y = 0.0f;
+
+        if (FC_mul_mv_glu == OP_GLU_NUM_REGLU) {
+            y = x0*x1*(x0 > 0.0f);
+        } else if (FC_mul_mv_glu == OP_GLU_NUM_GEGLU) {
+            const float gelu = 0.5f*x0*(1.0f + precise::tanh(SQRT_2_OVER_PI*x0*(1.0f + GELU_COEF_A*x0*x0)));
+            y = gelu*x1;
+        } else if (FC_mul_mv_glu == OP_GLU_NUM_SWIGLU) {
+            const float silu = x0 / (1.0f + exp(-x0));
+            y = silu*x1;
+        } else if (FC_mul_mv_glu == OP_GLU_NUM_GEGLU_ERF) {
+            const float gelu_erf = 0.5f*x0*(1.0f+erf_approx<float>(x0*SQRT_2_INV));
+            y = gelu_erf*x1;
+        } else if (FC_mul_mv_glu == OP_GLU_NUM_GEGLU_QUICK) {
+            const float gelu_quick = x0*(1.0f/(1.0f+exp(GELU_QUICK_COEF*x0)));
+            y = gelu_quick*x1;
+        }
+
+        d[i0] = y;
+    }
+}
+
+typedef decltype(kernel_mul_mv_glu<mmv_fn<kernel_mul_mv_t_t_disp<float, float>>>) kernel_mul_mv_glu_t;
+
+template [[host_name("kernel_mul_mv_glu_f32_f32")]] kernel kernel_mul_mv_glu_t kernel_mul_mv_glu<mmv_fn<kernel_mul_mv_t_t_disp<float, float>>>;
+template [[host_name("kernel_mul_mv_glu_f16_f32")]] kernel kernel_mul_mv_glu_t kernel_mul_mv_glu<mmv_fn<kernel_mul_mv_t_t_disp<half,  float>>>;
+#if defined(GGML_METAL_HAS_BF16)
+template [[host_name("kernel_mul_mv_glu_bf16_f32")]] kernel kernel_mul_mv_glu_t kernel_mul_mv_glu<mmv_fn<kernel_mul_mv_t_t_disp<bfloat, float>>>;
+#endif
+template [[host_name("kernel_mul_mv_glu_f32_f32_4")]] kernel kernel_mul_mv_glu_t kernel_mul_mv_glu<mmv_fn<kernel_mul_mv_t_t_4_disp<float, float4, float, float4>>>;
+template [[host_name("kernel_mul_mv_glu_f16_f32_4")]] kernel kernel_mul_mv_glu_t kernel_mul_mv_glu<mmv_fn<kernel_mul_mv_t_t_4_disp<half,  half4,  float, float4>>>;
+#if defined(GGML_METAL_HAS_BF16)
+template [[host_name("kernel_mul_mv_glu_bf16_f32_4")]] kernel kernel_mul_mv_glu_t kernel_mul_mv_glu<mmv_fn<kernel_mul_mv_t_t_4_disp<bfloat, bfloat4, float, float4>>>;
+#endif
+
+template [[host_name("kernel_mul_mv_glu_q8_0_f32")]] kernel kernel_mul_mv_glu_t kernel_mul_mv_glu<mmv_fn<kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0>>>;
+
+template [[host_name("kernel_mul_mv_glu_q1_0_f32")]] kernel kernel_mul_mv_glu_t kernel_mul_mv_glu<mmv_fn<kernel_mul_mv_q1_0_f32_impl<N_R0_Q1_0>>>;
+template [[host_name("kernel_mul_mv_glu_q2_0_f32")]] kernel kernel_mul_mv_glu_t kernel_mul_mv_glu<mmv_fn<kernel_mul_mv_q2_0_f32_impl<N_R0_Q2_0>>>;
+template [[host_name("kernel_mul_mv_glu_q4_0_f32")]] kernel kernel_mul_mv_glu_t kernel_mul_mv_glu<mmv_fn<mul_vec_q_n_f32_impl<block_q4_0, N_R0_Q4_0>>>;
+template [[host_name("kernel_mul_mv_glu_q4_1_f32")]] kernel kernel_mul_mv_glu_t kernel_mul_mv_glu<mmv_fn<mul_vec_q_n_f32_impl<block_q4_1, N_R0_Q4_1>>>;
+template [[host_name("kernel_mul_mv_glu_q5_0_f32")]] kernel kernel_mul_mv_glu_t kernel_mul_mv_glu<mmv_fn<mul_vec_q_n_f32_impl<block_q5_0, N_R0_Q5_0>>>;
+template [[host_name("kernel_mul_mv_glu_q5_1_f32")]] kernel kernel_mul_mv_glu_t kernel_mul_mv_glu<mmv_fn<mul_vec_q_n_f32_impl<block_q5_1, N_R0_Q5_1>>>;
+
+template [[host_name("kernel_mul_mv_glu_mxfp4_f32")]] kernel kernel_mul_mv_glu_t kernel_mul_mv_glu<mmv_fn<kernel_mul_mv_mxfp4_f32_impl<N_R0_MXFP4>>>;
+
+template [[host_name("kernel_mul_mv_glu_q2_K_f32")]] kernel kernel_mul_mv_glu_t kernel_mul_mv_glu<mmv_fn<kernel_mul_mv_q2_K_f32_impl   <N_R0_Q2_K>>>;
+template [[host_name("kernel_mul_mv_glu_q3_K_f32")]] kernel kernel_mul_mv_glu_t kernel_mul_mv_glu<mmv_fn<kernel_mul_mv_q3_K_f32_impl   <N_R0_Q3_K>>>;
+template [[host_name("kernel_mul_mv_glu_q4_K_f32")]] kernel kernel_mul_mv_glu_t kernel_mul_mv_glu<mmv_fn<kernel_mul_mv_q4_K_f32_impl   <N_R0_Q4_K>>>;
+template [[host_name("kernel_mul_mv_glu_q5_K_f32")]] kernel kernel_mul_mv_glu_t kernel_mul_mv_glu<mmv_fn<kernel_mul_mv_q5_K_f32_impl   <N_R0_Q5_K>>>;
+template [[host_name("kernel_mul_mv_glu_q6_K_f32")]] kernel kernel_mul_mv_glu_t kernel_mul_mv_glu<mmv_fn<kernel_mul_mv_q6_K_f32_impl   <N_R0_Q6_K>>>;
+template [[host_name("kernel_mul_mv_glu_iq1_s_f32")]] kernel kernel_mul_mv_glu_t kernel_mul_mv_glu<mmv_fn<kernel_mul_mv_iq1_s_f32_disp<ggml_metal_kargs_mul_mv>>>;
+template [[host_name("kernel_mul_mv_glu_iq1_m_f32")]] kernel kernel_mul_mv_glu_t kernel_mul_mv_glu<mmv_fn<kernel_mul_mv_iq1_m_f32_disp<ggml_metal_kargs_mul_mv>>>;
+template [[host_name("kernel_mul_mv_glu_iq2_xxs_f32")]] kernel kernel_mul_mv_glu_t kernel_mul_mv_glu<mmv_fn<kernel_mul_mv_iq2_xxs_f32_disp<ggml_metal_kargs_mul_mv>>>;
+template [[host_name("kernel_mul_mv_glu_iq2_xs_f32")]] kernel kernel_mul_mv_glu_t kernel_mul_mv_glu<mmv_fn<kernel_mul_mv_iq2_xs_f32_disp<ggml_metal_kargs_mul_mv>>>;
+template [[host_name("kernel_mul_mv_glu_iq3_xxs_f32")]] kernel kernel_mul_mv_glu_t kernel_mul_mv_glu<mmv_fn<kernel_mul_mv_iq3_xxs_f32_disp<ggml_metal_kargs_mul_mv>>>;
+template [[host_name("kernel_mul_mv_glu_iq3_s_f32")]] kernel kernel_mul_mv_glu_t kernel_mul_mv_glu<mmv_fn<kernel_mul_mv_iq3_s_f32_disp<ggml_metal_kargs_mul_mv>>>;
+template [[host_name("kernel_mul_mv_glu_iq2_s_f32")]] kernel kernel_mul_mv_glu_t kernel_mul_mv_glu<mmv_fn<kernel_mul_mv_iq2_s_f32_disp<ggml_metal_kargs_mul_mv>>>;
+template [[host_name("kernel_mul_mv_glu_iq4_nl_f32")]] kernel kernel_mul_mv_glu_t kernel_mul_mv_glu<mmv_fn<kernel_mul_mv_iq4_nl_f32_impl <N_R0_IQ4_NL>>>;
+template [[host_name("kernel_mul_mv_glu_iq4_xs_f32")]] kernel kernel_mul_mv_glu_t kernel_mul_mv_glu<mmv_fn<kernel_mul_mv_iq4_xs_f32_impl <N_R0_IQ4_XS>>>;
+template [[host_name("kernel_mul_mv_glu_tq2_0_f32")]] kernel kernel_mul_mv_glu_t kernel_mul_mv_glu<mmv_fn<kernel_mul_mv_tq2_0_f32_impl  <N_R0_TQ2_0>>>;

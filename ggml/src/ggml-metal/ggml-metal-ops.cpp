@@ -238,6 +238,13 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             if (fusion) {
                 // fused kernels write to the last node of the group, not necessarily to the first node's dst
                 is_concurrent = ggml_mem_ranges_check(ctx->mem_ranges, ctx->node(idx + n_fuse - 1));
+
+                // the FFN gate/up + GLU kernel also writes the results of both mat-muls
+                if (ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_MUL_MAT_GLU) {
+                    for (int i = 1; is_concurrent && i < n_fuse - 1; ++i) {
+                        is_concurrent = ggml_mem_ranges_check(ctx->mem_ranges, ctx->node(idx + i));
+                    }
+                }
             }
         }
 
@@ -2541,7 +2548,17 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
     const int16_t r2 = ne12/ne02;
     const int16_t r3 = ne13/ne03;
 
-    auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op);
+    // FFN gate/up + GLU: when the table fuses this mat-mul with the next one and the GLU of both, one dispatch runs
+    // the two mat-vecs and the activation. both mat-muls share their weight type and layout and their src1, so the
+    // parameters below hold for both
+    const int  n_fuse   = ggml_metal_op_try_fusion(ctx, idx, GGML_METAL_FUSION_MUL_MAT_GLU);
+    const bool fuse_glu = n_fuse > 1;
+
+    const ggml_tensor * glu = fuse_glu ? ctx->node(idx + n_fuse - 1) : nullptr;
+
+    auto pipeline = fuse_glu
+        ? ggml_metal_library_get_pipeline_mul_mv_glu(lib, op, ggml_get_glu_op(glu))
+        : ggml_metal_library_get_pipeline_mul_mv(lib, op);
 
     const int nr0 = pipeline.nr0;
     const int nr1 = pipeline.nr1;
@@ -2571,24 +2588,45 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
         /*.r3   =*/ r3,
     };
 
+    // src0 rows per threadgroup: these kernels split each row across the simdgroups, the others give each simdgroup rows
+    const bool rows_split = op->src[0]->type == GGML_TYPE_F32  ||
+                            op->src[0]->type == GGML_TYPE_F16  ||
+                            op->src[0]->type == GGML_TYPE_BF16 ||
+                            op->src[0]->type == GGML_TYPE_Q8_0;
+
+    const int nr0_tg = rows_split ? nr0 : nr0*nsg;
+
     ggml_metal_encoder_set_pipeline(enc, pipeline);
-    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+
+    if (fuse_glu) {
+        // the GLU gates its src0 (the activated projection) and multiplies by its src1
+        const ggml_tensor * mm_g = glu->src[0];
+        const ggml_tensor * mm_u = glu->src[1];
+
+        ggml_metal_kargs_mul_mv_glu args_glu = {
+            /*.mv     =*/ args,
+            /*.nr0_tg =*/ nr0_tg,
+        };
+
+        ggml_metal_encoder_set_bytes   (enc, &args_glu, sizeof(args_glu), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mm_g->src[0]), 1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mm_u->src[0]), 2);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]),   3);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mm_g),         4);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mm_u),         5);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(glu),          6);
+    } else {
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+    }
 
     ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-    if (op->src[0]->type == GGML_TYPE_F32 ||
-        op->src[0]->type == GGML_TYPE_F16 ||
-        op->src[0]->type == GGML_TYPE_BF16 ||
-        op->src[0]->type == GGML_TYPE_Q8_0) {
-        ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + nr0 - 1)/(nr0)), ((ne11 + nr1 - 1)/nr1), ne12*ne13, 32, nsg, 1);
-    } else {
-        ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + nr0*nsg - 1)/(nr0*nsg)), ((ne11 + nr1 - 1)/nr1), ne12*ne13, 32, nsg, 1);
-    }
+    ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + nr0_tg - 1)/nr0_tg), ((ne11 + nr1 - 1)/nr1), ne12*ne13, 32, nsg, 1);
 
-    return 1;
+    return n_fuse;
 }
 
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {

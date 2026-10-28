@@ -711,6 +711,132 @@ static bool ggml_metal_fusion_check_mul_mat_add(
         (add->data == res->data || !ggml_metal_fusion_overlap(add, res));
 }
 
+// the weight types of the generic mat-vec kernels, which kernel_mul_mv_glu wraps
+static bool ggml_metal_mul_mv_glu_type_supported(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_TQ2_0:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// MUL_MAT (gate) + MUL_MAT (up) + GLU, in either mat-mul order: the gate/up projections of an FFN, which read the same
+// activations. the structural checks do not depend on the batch size, so all ubatch sizes share one graph order; the
+// encoder fuses only a single token (one src1 row per matrix), which runs on the generic mat-vec kernels
+static bool ggml_metal_fusion_check_mul_mat_glu(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(fusion);
+    GGML_UNUSED(gf);
+    GGML_UNUSED(node_idxs);
+    GGML_UNUSED(idx);
+
+    const ggml_tensor * mm0 = nodes[0];
+    const ggml_tensor * mm1 = nodes[1];
+    const ggml_tensor * glu = nodes[2];
+
+    // a split GLU of the two mat-mul results, not swapped
+    if (glu->src[1] == nullptr || ggml_get_op_params_i32(glu, 1) != 0) {
+        return false;
+    }
+    if (!((glu->src[0] == mm0 && glu->src[1] == mm1) || (glu->src[0] == mm1 && glu->src[1] == mm0))) {
+        return false;
+    }
+
+    switch (ggml_get_glu_op(glu)) {
+        case GGML_GLU_OP_REGLU:
+        case GGML_GLU_OP_GEGLU:
+        case GGML_GLU_OP_SWIGLU:
+        case GGML_GLU_OP_GEGLU_ERF:
+        case GGML_GLU_OP_GEGLU_QUICK:
+            break;
+        default:
+            return false;
+    }
+
+    // both projections read the same activations with weights of the same type and layout
+    const ggml_tensor * w0 = mm0->src[0];
+    const ggml_tensor * w1 = mm1->src[0];
+
+    if (mm0->src[1] != mm1->src[1] || mm0->src[1]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (w0->type != w1->type || !ggml_metal_mul_mv_glu_type_supported(w0->type) ||
+        !ggml_are_same_shape(w0, w1) || !ggml_are_same_stride(w0, w1)) {
+        return false;
+    }
+    if (ggml_get_op_params_i32(mm0, 1) == GGML_HINT_SRC0_IS_HADAMARD || ggml_get_op_params_i32(mm1, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        return false;
+    }
+    if (ggml_is_transposed(w0) || ggml_is_transposed(mm0->src[1])) {
+        return false;
+    }
+    // the f32/f16/bf16 kernels for rows shorter than a simdgroup use one thread per row (the _short variant)
+    if (w0->ne[0] < 32) {
+        return false;
+    }
+
+    // the activation reads the mat-mul results element-wise
+    if (mm0->type != GGML_TYPE_F32 || mm1->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(mm0, glu) || !ggml_are_same_shape(mm1, glu) ||
+        !ggml_is_contiguous(mm0) || !ggml_is_contiguous(mm1) || !ggml_is_contiguous(glu)) {
+        return false;
+    }
+
+    if (mode == GGML_METAL_FUSION_STRUCTURAL) {
+        return true;
+    }
+
+    // a single src1 row per matrix takes the generic mat-vec path (the MMA, ext and mat-mat paths need more rows)
+    if (mm0->src[1]->ne[1] != 1) {
+        return false;
+    }
+
+    // the fused kernel also writes both mat-mul results, which must not alias their inputs; the activation output
+    // may alias them in place, as each element is read and written by the same thread
+    const ggml_tensor * src1 = mm0->src[1];
+    for (const ggml_tensor * mm : { mm0, mm1 }) {
+        if (ggml_metal_fusion_overlap(mm, src1) || ggml_metal_fusion_overlap(mm, w0) || ggml_metal_fusion_overlap(mm, w1)) {
+            return false;
+        }
+    }
+    if (ggml_metal_fusion_overlap(mm0, mm1)) {
+        return false;
+    }
+
+    return !ggml_metal_fusion_overlap(glu, src1) && !ggml_metal_fusion_overlap(glu, w0) && !ggml_metal_fusion_overlap(glu, w1);
+}
+
 // ---- patterns ------------------------------------------------------------
 
 static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
@@ -761,6 +887,7 @@ static const std::vector<ggml_op> ops_moe_reduce_8 = {
 };
 
 static const std::vector<ggml_op> ops_mul_mat_add = { GGML_OP_MUL_MAT, GGML_OP_ADD };
+static const std::vector<ggml_op> ops_mul_mat_glu = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU };
 
 static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_NORM_MUL,       ops_norm_mul,               {},     false, ggml_metal_fusion_check_norm },
@@ -790,6 +917,9 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_8,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          {},     false, ggml_metal_fusion_check_ssm_conv_silu },
     { GGML_METAL_FUSION_MUL_MAT_ADD,    ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_add },
+    // not an element-wise chain (both mat-muls read the activations), so the check is the sole validator; the
+    // fused kernel also writes the two mat-mul results, which are additional outputs
+    { GGML_METAL_FUSION_MUL_MAT_GLU,    ops_mul_mat_glu,            {0, 1}, true,  ggml_metal_fusion_check_mul_mat_glu },
 };
 
 // ---- alloc deps -----------------------------------------------------------

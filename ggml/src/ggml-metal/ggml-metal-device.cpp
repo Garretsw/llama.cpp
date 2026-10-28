@@ -983,7 +983,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op) {
+// glu_op < 0: the plain mat-vec kernel; otherwise the FFN gate/up + GLU wrapper of the same kernel (kernel_mul_mv_glu),
+// which shares its parameters
+static ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_impl(ggml_metal_library_t lib, const ggml_tensor * op, int glu_op) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
 
@@ -1002,6 +1004,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     const char * suffix = "";
 
     bool split = false;
+    bool is_short = false; // one thread per row
 
     // use custom matrix x vector kernel
     switch (tsrc0) {
@@ -1014,6 +1017,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                     nr0 = 32;
                     nr1 = 1;
                     suffix = "_short";
+                    is_short = true;
                 } else {
                     nsg = std::min(4, (ne00 + 127) / 128);
                     nr0 = 2;
@@ -1199,8 +1203,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     const int16_t r2 = (int16_t) (ne12 / ne02);
     const int16_t r3 = (int16_t) (ne13 / ne03);
 
-    snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
-    snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d_split=%d", base, nsg, ne12, r2, r3, split);
+    if (glu_op < 0) {
+        snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
+        snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d_split=%d", base, nsg, ne12, r2, r3, split);
+    } else {
+        GGML_ASSERT(!is_short); // the GLU fusion excludes rows shorter than a simdgroup
+        snprintf(base, 256, "kernel_mul_mv_glu_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
+        snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d_split=%d_glu=%d", base, nsg, ne12, r2, r3, split, glu_op);
+    }
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -1211,6 +1221,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
         ggml_metal_cv_set_int16(cv, r2,             FC_MUL_MV + 3);
         ggml_metal_cv_set_int16(cv, r3,             FC_MUL_MV + 4);
         ggml_metal_cv_set_bool (cv, split,          FC_MUL_MV + 5);
+        if (glu_op >= 0) {
+            ggml_metal_cv_set_int16(cv, (int16_t) glu_op, FC_MUL_MV + 6);
+        }
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
@@ -1223,6 +1236,25 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     res.smem = smem;
 
     return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op) {
+    return ggml_metal_library_get_pipeline_mul_mv_impl(lib, op, -1);
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_glu(ggml_metal_library_t lib, const ggml_tensor * op, enum ggml_glu_op glu_op) {
+    int op_num = -1;
+
+    switch (glu_op) {
+        case GGML_GLU_OP_REGLU:       op_num = OP_GLU_NUM_REGLU;       break;
+        case GGML_GLU_OP_GEGLU:       op_num = OP_GLU_NUM_GEGLU;       break;
+        case GGML_GLU_OP_SWIGLU:      op_num = OP_GLU_NUM_SWIGLU;      break;
+        case GGML_GLU_OP_GEGLU_ERF:   op_num = OP_GLU_NUM_GEGLU_ERF;   break;
+        case GGML_GLU_OP_GEGLU_QUICK: op_num = OP_GLU_NUM_GEGLU_QUICK; break;
+        default: GGML_ABORT("fatal error");
+    }
+
+    return ggml_metal_library_get_pipeline_mul_mv_impl(lib, op, op_num);
 }
 
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(ggml_metal_library_t lib, int ne02, int ne20) {

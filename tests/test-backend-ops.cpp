@@ -12329,6 +12329,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             true, 16, 8, b, false, true, false));
     }
 
+    // dense gate/up + GLU of a single token (Metal kernel_mul_mv_glu) for the mat-vec weight types and GLU ops the
+    // loops above leave out, with a row count that leaves a partial last threadgroup
+    for (ggml_type type : {GGML_TYPE_BF16, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
+                           GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XS,
+                           GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS,
+                           GGML_TYPE_TQ2_0}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 37, 256,
+            false, 16, 8, false, false, true, false, {1, 1}));
+    }
+    // rows long enough for the IQ kernels that do not split rows across threads
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_IQ2_XXS}) {
+        for (ggml_glu_op glu_op : {GGML_GLU_OP_REGLU, GGML_GLU_OP_GEGLU_ERF, GGML_GLU_OP_GEGLU_QUICK}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, 1, 37, 1024,
+                false, 16, 8, false, false, true, false, {1, 1}));
+        }
+    }
+    // f16 rows that are not a multiple of 4
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_F16, GGML_GLU_OP_SWIGLU, 1, 37, 258,
+        false, 16, 8, false, false, true, false, {1, 1}));
+
     // Gate and up on the SYCL XMX kernels: rows long enough for 2D block loads, a last tile of 8 rows, and
     // columns on both sides of the 8 and 16 column tiles
     for (ggml_type type : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
