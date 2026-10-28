@@ -3283,8 +3283,8 @@ static bool ggml_metal_op_flash_attn_ext_use_tensor(const ggml_tensor * op, bool
     const int64_t nqptg = dk >= 512 ? OP_FLASH_ATTN_EXT_TENSOR_NQPSG_LARGE : OP_FLASH_ATTN_EXT_TENSOR_NQPSG;
 
     // few heads and small batches do not fill the GPU - the half8x8 kernel is faster there
-    // TODO: tune per device
-    if (((ne01 + nqptg - 1)/nqptg)*ne02*ne03*dk < 8192) {
+    // TODO: tune per device (4096 measured on M5 Pro, local only)
+    if (((ne01 + nqptg - 1)/nqptg)*ne02*ne03*dk < 4096) {
         return false;
     }
 
